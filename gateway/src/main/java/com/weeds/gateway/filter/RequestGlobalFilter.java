@@ -22,6 +22,7 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.Arrays;
 import java.util.List;
@@ -53,42 +54,91 @@ public class RequestGlobalFilter implements GlobalFilter {
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         ServerHttpRequest request = LogUtils.handlePreRequestLog(exchange);
         ServerHttpResponse response = exchange.getResponse();
-        // 处理业务
-        // 数据库根据 accessKey 查询用户
         HttpHeaders headers = request.getHeaders();
+
         String accessKey = headers.getFirst(OpenApiReqHeaderConstant.ACCESS_KEY);
         String method = headers.getFirst(OpenApiReqHeaderConstant.METHOD_TYPE);
         String apiUrl = headers.getFirst(OpenApiReqHeaderConstant.API_URL);
-        User invokeUser = null;
-        InterfaceInfo invokeInterfaceInfo = null;
-        try {
-            invokeUser = innerUserService.getInvokeUser(accessKey);
-        } catch (Exception e) {
-            log.error("Gateway getInvokeUser error", e);
-        }
-        try {
-            invokeInterfaceInfo = innerInterfaceInfoService.getInvokeInterfaceInfo(apiUrl, method);
-        } catch (Exception e) {
-            log.error("Gateway getInvokeInterfaceInfo error", e);
-        }
-        if (invokeUser == null || invokeInterfaceInfo == null) {
-            return handleForbiddenResponse(response);
-        }
-        // 验证（处理业务）
-        Mono<Void> mono = verificationRequest(request, response, invokeUser);
-        if (mono != null) {
-            return mono;
-        }
 
-        ServerHttpRequest mutateReq = request.mutate()
-                // 添加用户Id、接口Id，方便响应过滤器处理
-                .header(RequestHeaderConstant.USER_ID, Long.toString(invokeUser.getId()))
-                .header(RequestHeaderConstant.INTERFACE_ID, Long.toString(invokeInterfaceInfo.getId()))
-                .header(RequestHeaderConstant.TIME_STAMP, Long.toString(System.currentTimeMillis()))
-                .build();
-        ServerWebExchange mutateExchange = exchange.mutate().request(mutateReq).build();
-        return chain.filter(mutateExchange);
+        // 1. 并行调用两个接口（使用 zip 组合）
+        return Mono.zip(
+                        // 包装同步调用，放入专门的弹性线程池执行，避免阻塞 Netty
+                        Mono.fromCallable(() -> innerUserService.getInvokeUser(accessKey))
+                                .subscribeOn(Schedulers.boundedElastic())
+                                .onErrorReturn(new User()), // 异常处理：返回空对象防止链条崩掉
+
+                        Mono.fromCallable(() -> innerInterfaceInfoService.getInvokeInterfaceInfo(apiUrl, method))
+                                .subscribeOn(Schedulers.boundedElastic())
+                                .onErrorReturn(new InterfaceInfo())
+                )
+                .flatMap(tuple -> {
+                    // tuple 里包含了上面两个调用的结果
+                    User invokeUser = tuple.getT1();
+                    InterfaceInfo invokeInterfaceInfo = tuple.getT2();
+
+                    // 2. 校验用户信息和接口信息
+                    if (invokeUser == null || invokeUser.getId() == null ||
+                            invokeInterfaceInfo == null || invokeInterfaceInfo.getId() == null) {
+                        return handleForbiddenResponse(response);
+                    }
+
+                    // 3. 继续执行原有的验证逻辑
+                    Mono<Void> verificationMono = verificationRequest(request, response, invokeUser);
+                    if (verificationMono != null) {
+                        return verificationMono;
+                    }
+
+                    // 4. 构建新的 Request 并向下传递
+                    ServerHttpRequest mutateReq = request.mutate()
+                            .header(RequestHeaderConstant.USER_ID, Long.toString(invokeUser.getId()))
+                            .header(RequestHeaderConstant.INTERFACE_ID, Long.toString(invokeInterfaceInfo.getId()))
+                            .header(RequestHeaderConstant.TIME_STAMP, Long.toString(System.currentTimeMillis()))
+                            .build();
+
+                    return chain.filter(exchange.mutate().request(mutateReq).build());
+                });
     }
+
+//    @Override
+//    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+//        ServerHttpRequest request = LogUtils.handlePreRequestLog(exchange);
+//        ServerHttpResponse response = exchange.getResponse();
+//        // 处理业务
+//        // 数据库根据 accessKey 查询用户
+//        HttpHeaders headers = request.getHeaders();
+//        String accessKey = headers.getFirst(OpenApiReqHeaderConstant.ACCESS_KEY);
+//        String method = headers.getFirst(OpenApiReqHeaderConstant.METHOD_TYPE);
+//        String apiUrl = headers.getFirst(OpenApiReqHeaderConstant.API_URL);
+//        User invokeUser = null;
+//        InterfaceInfo invokeInterfaceInfo = null;
+//        try {
+//            invokeUser = innerUserService.getInvokeUser(accessKey);
+//        } catch (Exception e) {
+//            log.error("Gateway getInvokeUser error", e);
+//        }
+//        try {
+//            invokeInterfaceInfo = innerInterfaceInfoService.getInvokeInterfaceInfo(apiUrl, method);
+//        } catch (Exception e) {
+//            log.error("Gateway getInvokeInterfaceInfo error", e);
+//        }
+//        if (invokeUser == null || invokeInterfaceInfo == null) {
+//            return handleForbiddenResponse(response);
+//        }
+//        // 验证（处理业务）
+//        Mono<Void> mono = verificationRequest(request, response, invokeUser);
+//        if (mono != null) {
+//            return mono;
+//        }
+//
+//        ServerHttpRequest mutateReq = request.mutate()
+//                // 添加用户Id、接口Id，方便响应过滤器处理
+//                .header(RequestHeaderConstant.USER_ID, Long.toString(invokeUser.getId()))
+//                .header(RequestHeaderConstant.INTERFACE_ID, Long.toString(invokeInterfaceInfo.getId()))
+//                .header(RequestHeaderConstant.TIME_STAMP, Long.toString(System.currentTimeMillis()))
+//                .build();
+//        ServerWebExchange mutateExchange = exchange.mutate().request(mutateReq).build();
+//        return chain.filter(mutateExchange);
+//    }
 
     /**
      * 处理业务
